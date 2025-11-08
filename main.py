@@ -24,6 +24,7 @@ VALID_METRICS = {
 
 # ---------------- HELPERS ----------------
 def get_cik(ticker):
+    """Get SEC CIK for ticker"""
     url = "https://www.sec.gov/files/company_tickers.json"
     headers = {"User-Agent": "Andres Garcia (30andgarcia@yourdomain.com)"}
     r = requests.get(url, headers=headers)
@@ -55,7 +56,6 @@ def fetch_tag(base_url, headers, tag_list):
 # -------------- DATA FETCH + CALC --------------
 def fetch_and_cache_fundamentals(ticker):
     """Fetch new fundamentals and store in cache"""
-    print(f"🔄 Refreshing data for {ticker}")
     cik = get_cik(ticker)
     if not cik:
         return {"error": f"CIK not found for {ticker}"}
@@ -83,23 +83,30 @@ def fetch_and_cache_fundamentals(ticker):
         "EPS (Diluted)": ["EarningsPerShareDiluted"],
         "Operating Cash Flow": ["NetCashProvidedByUsedInOperatingActivities"],
         "Capital Expenditures": ["PaymentsToAcquirePropertyPlantAndEquipment"],
+        "Dividends Paid": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
     }
 
     data = {}
     for k, v in tags.items():
         val, _ = fetch_tag(base_url, headers, v)
         data[k] = val
+        if val is None:
+            print(f"⚠️ Could not fetch {k} for {ticker}")
 
     # Yahoo Finance supplement
     yf_tkr = yf.Ticker(ticker)
     info = yf_tkr.info
+
+    # Fill missing from Yahoo
     data["Share Price"] = info.get("currentPrice")
     data["Shares Outstanding"] = info.get("sharesOutstanding")
     data["Market Capitalization"] = info.get("marketCap")
-
-    # Derive EPS if missing
-    if not data.get("EPS (Diluted)") and data.get("Net Income") and data.get("Shares Outstanding"):
-        data["EPS (Diluted)"] = data["Net Income"] / data["Shares Outstanding"]
+    data["Gross Margin"] = info.get("grossMargins") * 100 if info.get("grossMargins") is not None else None
+    data["Operating Margin"] = info.get("operatingMargins") * 100 if info.get("operatingMargins") is not None else None
+    data["Profit Margin"] = info.get("profitMargins") * 100 if info.get("profitMargins") is not None else None
+    data["EPS (Diluted)"] = data.get("EPS (Diluted)") or info.get("trailingEps")
+    data["Revenue"] = data.get("Revenue") or info.get("totalRevenue")
+    data["EBIT"] = data.get("Operating Income (EBIT)") or info.get("ebit") or data.get("Operating Income (EBIT)")
 
     # Core derived metrics
     data["Total Debt"] = (data.get("Long-Term Debt") or 0) + (data.get("Short-Term Debt") or 0)
@@ -108,53 +115,48 @@ def fetch_and_cache_fundamentals(ticker):
     # Ratios
     try:
         data["P/E"] = data["Share Price"] / data["EPS (Diluted)"]
-    except Exception:
+    except:
         data["P/E"] = None
 
     try:
         data["PB Ratio"] = data["Share Price"] / (data["Shareholders' Equity"] / data["Shares Outstanding"])
-    except Exception:
+    except:
         data["PB Ratio"] = None
 
     try:
         data["PS Ratio"] = data["Market Capitalization"] / data["Revenue"]
-    except Exception:
+    except:
         data["PS Ratio"] = None
 
     try:
         data["Debt / Equity Ratio"] = data["Total Debt"] / data["Shareholders' Equity"]
-    except Exception:
+    except:
         data["Debt / Equity Ratio"] = None
 
     try:
         data["Current Ratio"] = data["Total Current Assets"] / data["Total Current Liabilities"]
-    except Exception:
+    except:
         data["Current Ratio"] = None
 
     try:
-        data["Free Cash Flow Margin"] = data["Free Cash Flow"] / data["Revenue"]
-    except Exception:
+        data["Free Cash Flow Margin"] = data["Free Cash Flow"] / data["Revenue"] * 100
+    except:
         data["Free Cash Flow Margin"] = None
 
     try:
-        data["Return on Equity (ROE)"] = data["Net Income"] / data["Shareholders' Equity"]
-    except Exception:
+        data["Return on Equity (ROE)"] = data["Net Income"] / data["Shareholders' Equity"] * 100
+    except:
         data["Return on Equity (ROE)"] = None
 
     try:
-        data["Return on Assets (ROA)"] = data["Net Income"] / data["Total Assets"]
-    except Exception:
+        data["Return on Assets (ROA)"] = data["Net Income"] / data["Total Assets"] * 100
+    except:
         data["Return on Assets (ROA)"] = None
 
     try:
-        data["Profit Margin"] = data["Net Income"] / data["Revenue"]
-    except Exception:
-        data["Profit Margin"] = None
-
-    try:
-        data["Operating Margin"] = data["Operating Income (EBIT)"] / data["Revenue"]
-    except Exception:
-        data["Operating Margin"] = None
+        data["EBIT Margin"] = data["EBIT"] / data["Revenue"] * 100
+    except:
+        data["EBIT Margin"] = None
 
     CACHE[ticker] = {"timestamp": time(), "data": data}
     return data
