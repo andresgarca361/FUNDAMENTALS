@@ -1,13 +1,12 @@
 from flask import Flask, request, jsonify
 import requests
 import yfinance as yf
-import pandas as pd
 from time import sleep, time
 
 app = Flask(__name__)
 
-CACHE = {}
-CACHE_TTL = 3600  # 1 hour
+CACHE = {}  # cache[ticker] = {"timestamp": float, "data": {...}}
+CACHE_TTL = 3600  # refresh every hour
 
 VALID_METRICS = {
     "P/E", "PE Ratio", "PB Ratio", "PS Ratio", "EV/EBITDA Ratio", "EV/Sales Ratio",
@@ -25,6 +24,7 @@ VALID_METRICS = {
 
 # ---------------- HELPERS ----------------
 def get_cik(ticker):
+    """Get SEC CIK for ticker"""
     url = "https://www.sec.gov/files/company_tickers.json"
     headers = {"User-Agent": "Andres Garcia (30andgarcia@yourdomain.com)"}
     r = requests.get(url, headers=headers)
@@ -56,63 +56,9 @@ def fetch_tag(base_url, headers, tag_list):
         sleep(0.15)
     return None, None
 
-def safe_div(a, b, mult=1):
-    try:
-        if a is not None and b not in (None, 0):
-            return (a / b) * mult
-    except Exception:
-        pass
-    return None
-
-def get_annual_from_yf(tkr):
-    out = {}
-    try:
-        fin = tkr.financials
-        if fin is not None and not fin.empty:
-            df = fin.copy()
-            for label in ["Total Revenue", "TotalRevenue", "Revenue"]:
-                if label in df.index:
-                    out["revenue_annual"] = df.loc[label].dropna().values.tolist()
-                    break
-            for label in ["Net Income", "NetIncome"]:
-                if label in df.index:
-                    out["netincome_annual"] = df.loc[label].dropna().values.tolist()
-                    break
-    except Exception:
-        pass
-
-    try:
-        eps_df = tkr.earnings
-        if eps_df is not None and not eps_df.empty:
-            out["eps_annual"] = eps_df["Earnings"].dropna().tolist()
-    except Exception:
-        pass
-
-    try:
-        cf = tkr.cashflow
-        if cf is not None and not cf.empty:
-            for label in ["Total Cash From Operating Activities", "Net Cash Provided By Operating Activities"]:
-                if label in cf.index:
-                    out["ocf_annual"] = cf.loc[label].dropna().values.tolist()
-                    break
-            for label in ["Capital Expenditures", "Purchases of property, plant and equipment"]:
-                if label in cf.index:
-                    out["capex_annual"] = cf.loc[label].dropna().values.tolist()
-                    break
-    except Exception:
-        pass
-
-    try:
-        divs = tkr.dividends
-        if divs is not None and not divs.empty:
-            out["dividends_series"] = divs.copy()
-    except Exception:
-        pass
-
-    return out
-
-# ---------------- FUNDAMENTAL FETCH ----------------
+# -------------- DATA FETCH + CALC --------------
 def fetch_and_cache_fundamentals(ticker):
+    """Fetch new fundamentals and store in cache"""
     cik = get_cik(ticker)
     if not cik:
         return {"error": f"CIK not found for {ticker}"}
@@ -124,126 +70,136 @@ def fetch_and_cache_fundamentals(ticker):
         "Total Assets": ["Assets"],
         "Total Liabilities": ["Liabilities"],
         "Shareholders' Equity": ["StockholdersEquity"],
+        "Total Current Assets": ["AssetsCurrent"],
+        "Total Current Liabilities": ["LiabilitiesCurrent"],
+        "Cash & Equivalents": ["CashAndCashEquivalentsAtCarryingValue"],
+        "Short-Term Investments": ["MarketableSecuritiesCurrent", "ShortTermInvestments"],
+        "Long-Term Debt": ["LongTermDebtNoncurrent"],
+        "Short-Term Debt": ["ShortTermBorrowings", "CommercialPaper", "ShortTermDebtCurrent"],
+        "Retained Earnings": ["RetainedEarningsAccumulatedDeficit"],
         "Revenue": ["Revenues", "SalesRevenueNet"],
         "Gross Profit": ["GrossProfit"],
         "Operating Income (EBIT)": ["OperatingIncomeLoss"],
         "Net Income": ["NetIncomeLoss"],
+        "Interest Expense": ["InterestExpense"],
+        "Income Tax Expense": ["IncomeTaxExpenseBenefit"],
+        "EPS (Diluted)": ["EarningsPerShareDiluted"],
         "Operating Cash Flow": ["NetCashProvidedByUsedInOperatingActivities"],
         "Capital Expenditures": ["PaymentsToAcquirePropertyPlantAndEquipment"],
-        "Dividends Paid": ["PaymentsOfDividends"],
-        "Interest Expense": ["InterestExpense"],
-        "EPS (Diluted)": ["EarningsPerShareDiluted"]
+        "Dividends Paid": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
     }
 
-    data, sources = {}, {}
-    for label, tag_list in tags.items():
-        val, dt = fetch_tag(base_url, headers, tag_list)
-        data[label] = val
-        sources[label] = "SEC" if val is not None else None
+    data = {}
+    for k, v in tags.items():
+        val, _ = fetch_tag(base_url, headers, v)
+        data[k] = val
+        if val is None:
+            print(f"⚠️ Could not fetch {k} for {ticker}")
 
+    # Yahoo Finance supplement
     yf_tkr = yf.Ticker(ticker)
+    info = {}
     try:
         info = yf_tkr.info or {}
-    except Exception:
+    except:
         info = {}
 
-    # fallback fill
-    def yfill(field, ykey, mult=1):
-        if data.get(field) is None and info.get(ykey) is not None:
-            data[field] = info[ykey] * mult
-            sources[field] = f"YF.info.{ykey}"
-
-    yfill("Revenue", "totalRevenue")
-    yfill("Net Income", "netIncomeToCommon")
-    yfill("Market Capitalization", "marketCap")
-    yfill("Gross Margin", "grossMargins", 100)
-    yfill("Operating Margin", "operatingMargins", 100)
-    yfill("Profit Margin", "profitMargins", 100)
-
+    # Fill missing from Yahoo
     data["Share Price"] = info.get("currentPrice")
     data["Shares Outstanding"] = info.get("sharesOutstanding")
+    data["Market Capitalization"] = info.get("marketCap")
+    data["Gross Margin"] = info.get("grossMargins") * 100 if info.get("grossMargins") is not None else None
+    data["Operating Margin"] = info.get("operatingMargins") * 100 if info.get("operatingMargins") is not None else None
+    data["Profit Margin"] = info.get("profitMargins") * 100 if info.get("profitMargins") is not None else None
+    data["EPS (Diluted)"] = data.get("EPS (Diluted)") or info.get("trailingEps")
+    data["Revenue"] = data.get("Revenue") or info.get("totalRevenue")
+    data["EBIT"] = data.get("Operating Income (EBIT)") or info.get("ebit") or data.get("Operating Income (EBIT)")
 
-    # compute margins safely
-    if data.get("Gross Margin") is None and data.get("Gross Profit") and data.get("Revenue"):
-        gm = safe_div(data["Gross Profit"], data["Revenue"], 100)
-        if gm and 0 < gm < 100:
-            data["Gross Margin"] = gm
+    # Core derived metrics
+    try:
+        data["Total Debt"] = (data.get("Long-Term Debt") or 0) + (data.get("Short-Term Debt") or 0)
+    except:
+        data["Total Debt"] = None
+    try:
+        data["Free Cash Flow"] = (data.get("Operating Cash Flow") or 0) + (data.get("Capital Expenditures") or 0)
+    except:
+        data["Free Cash Flow"] = None
 
-    # growth metrics
-    yf_annual = get_annual_from_yf(yf_tkr)
-
-    def clean_growth(series, label):
-        if series and len(series) >= 2:
-            last, prev = series[0], series[1]
-            growth = safe_div(last - prev, prev, 100)
-            if growth is not None and not (-5 < growth < 200):
-                growth = None
-            data[label] = growth
-            sources[label] = "YF.annual_series"
-        else:
-            data[label] = None
-
-    clean_growth(yf_annual.get("revenue_annual"), "Revenue Growth (YoY)")
-    clean_growth(yf_annual.get("netincome_annual"), "Net Income Growth")
+    # Ratios
+    try:
+        data["P/E"] = data["Share Price"] / data["EPS (Diluted)"] if data.get("Share Price") and data.get("EPS (Diluted)") else None
+    except:
+        data["P/E"] = None
 
     try:
-        ocf, capex = yf_annual.get("ocf_annual"), yf_annual.get("capex_annual")
-        if ocf and capex and len(ocf) >= 2 and len(capex) >= 2:
-            fcf_last, fcf_prev = ocf[0] - capex[0], ocf[1] - capex[1]
-            growth = safe_div(fcf_last - fcf_prev, fcf_prev, 100)
-            if growth is not None and not (-5 < growth < 200):
-                growth = None
-            data["Free Cash Flow Growth"] = growth
-            sources["Free Cash Flow Growth"] = "YF.cashflow"
-    except Exception:
-        data["Free Cash Flow Growth"] = None
+        data["PB Ratio"] = data["Share Price"] / (data["Shareholders' Equity"] / data["Shares Outstanding"]) if data.get("Share Price") and data.get("Shareholders' Equity") and data.get("Shares Outstanding") else None
+    except:
+        data["PB Ratio"] = None
 
-    clean_growth(yf_annual.get("eps_annual"), "EPS Growth")
-
-    # fixed Dividend Growth
     try:
-        divs = yf_tkr.dividends
-        if divs is not None and not divs.empty:
-            divs.index = divs.index - pd.Timedelta(days=1)
-            ann = divs.groupby(divs.index.year).sum().sort_index()
-            this_year = pd.Timestamp.now().year
-            if this_year in ann.index and len(ann.index) >= 3:
-                ann = ann.drop(this_year)
-            if len(ann) >= 2:
-                prev, last = ann.iloc[-2], ann.iloc[-1]
-                growth = safe_div(last - prev, prev, 100)
-                if growth is not None and not (-5 < growth < 200):
-                    growth = None
-                data["Dividend Growth"] = growth
-                sources["Dividend Growth"] = "YF.dividends_yearly_fixed"
-            else:
-                data["Dividend Growth"] = None
-    except Exception:
-        data["Dividend Growth"] = None
+        data["PS Ratio"] = data["Market Capitalization"] / data["Revenue"] if data.get("Market Capitalization") and data.get("Revenue") else None
+    except:
+        data["PS Ratio"] = None
 
-    data["_sources"] = sources
+    try:
+        data["Debt / Equity Ratio"] = data["Total Debt"] / data["Shareholders' Equity"] if data.get("Total Debt") and data.get("Shareholders' Equity") else None
+    except:
+        data["Debt / Equity Ratio"] = None
+
+    try:
+        data["Current Ratio"] = data["Total Current Assets"] / data["Total Current Liabilities"] if data.get("Total Current Assets") and data.get("Total Current Liabilities") else None
+    except:
+        data["Current Ratio"] = None
+
+    try:
+        data["Free Cash Flow Margin"] = data["Free Cash Flow"] / data["Revenue"] * 100 if data.get("Free Cash Flow") and data.get("Revenue") else None
+    except:
+        data["Free Cash Flow Margin"] = None
+
+    try:
+        data["Return on Equity (ROE)"] = data["Net Income"] / data["Shareholders' Equity"] * 100 if data.get("Net Income") and data.get("Shareholders' Equity") else None
+    except:
+        data["Return on Equity (ROE)"] = None
+
+    try:
+        data["Return on Assets (ROA)"] = data["Net Income"] / data["Total Assets"] * 100 if data.get("Net Income") and data.get("Total Assets") else None
+    except:
+        data["Return on Assets (ROA)"] = None
+
+    try:
+        data["EBIT Margin"] = data["EBIT"] / data["Revenue"] * 100 if data.get("EBIT") and data.get("Revenue") else None
+    except:
+        data["EBIT Margin"] = None
+
+    # Additional, possible ratios and metrics can be restored using similar logic
+
     CACHE[ticker] = {"timestamp": time(), "data": data}
     return data
 
 def get_fundamentals(ticker):
+    """Return cached data if fresh, else refresh"""
     now = time()
     if ticker in CACHE and now - CACHE[ticker]["timestamp"] < CACHE_TTL:
         return CACHE[ticker]["data"]
-    return fetch_and_cache_fundamentals(ticker)
+    else:
+        return fetch_and_cache_fundamentals(ticker)
 
+# -------------- ROUTE --------------
 @app.route("/fundamental", methods=["GET"])
 def get_metric():
     ticker = request.args.get("ticker", "").upper().strip()
     metric = request.args.get("metric", "").strip()
     if not ticker or not metric:
-        return jsonify({"error":"Missing required parameters: ?ticker=XXX&metric=YYY"}), 400
+        return jsonify({"error": "Missing required parameters: ?ticker=XXX&metric=YYY"}), 400
     if metric not in VALID_METRICS:
         return jsonify({"error": f"Invalid metric '{metric}'. Must be one of: {sorted(list(VALID_METRICS))}"}), 400
 
     data = get_fundamentals(ticker)
     if "error" in data:
         return jsonify(data), 400
+
     return jsonify({"ticker": ticker, "metric": metric, "value": data.get(metric)})
 
+# -------------- RUN --------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=8080)
