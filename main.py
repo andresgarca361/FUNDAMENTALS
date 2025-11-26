@@ -105,7 +105,7 @@ def fetch_and_cache_fundamentals(ticker):
         "Dividends Paid": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
     }
 
-    # EXPANDED Verified tag fallbacks (now with JPM's exact shorter tags + more debt variants)
+    # EXPANDED Verified tag fallbacks (JPM-tested shorter EBIT tags + extra debt variants)
     FALLBACK_TAGS = {
         # Universal (works for all)
         "Total Assets": ["Assets"],
@@ -176,7 +176,7 @@ def fetch_and_cache_fundamentals(ticker):
     except:
         info = {}
 
-    # Fill missing from Yahoo
+    # Fill missing from Yahoo (primary fills used earlier)
     data["Share Price"] = info.get("currentPrice")
     data["Shares Outstanding"] = info.get("sharesOutstanding")
     data["Market Capitalization"] = info.get("marketCap")
@@ -197,7 +197,7 @@ def fetch_and_cache_fundamentals(ticker):
     except:
         data["Free Cash Flow"] = None
 
-    # Ratios
+    # Ratios (initial tries)
     try:
         data["P/E"] = data["Share Price"] / data["EPS (Diluted)"] if data.get("Share Price") and data.get("EPS (Diluted)") else None
     except:
@@ -250,8 +250,7 @@ def fetch_and_cache_fundamentals(ticker):
         yf_total_debt = info.get("totalDebt") or 0
         yf_ebitda_ratio = info.get("enterpriseToEbitda")  # EV / EBITDA
         if yf_ebitda_ratio and yf_ebitda_ratio != 0:
-            # User-provided approach: invert enterpriseToEbitda as an approximation for Debt/EBITDA
-            # (note: EV/EBITDA inverted is EBITDA/EV; this is the requested heuristic)
+            # Invert enterpriseToEbitda as an approximation for Debt/EBITDA per user's heuristic
             data["Debt / EBITDA Ratio"] = 1 / yf_ebitda_ratio
         elif yf_total_debt > 0:
             # Step 2: Derive from SEC (now with fixed tags)
@@ -276,6 +275,141 @@ def fetch_and_cache_fundamentals(ticker):
     except Exception as e:
         print(f"Error calculating Debt/EBITDA for {ticker}: {e}")
         data["Debt / EBITDA Ratio"] = None
+
+    # ---------------- FINAL ROBUST YFINANCE FALLBACK (only fill remaining None values) ----------------
+    # Map of metric -> possible yfinance info keys (try in order). Fill only when metric is None.
+    YF_FALLBACKS = {
+        "Total Assets": ["totalAssets", "total_assets"],
+        "Total Liabilities": ["totalLiab", "totalLiabilities", "total_liabilities"],
+        "Shareholders' Equity": ["totalStockholderEquity", "stockholdersEquity", "totalEquity"],
+        "Net Income": ["netIncome", "netIncomeToCommonStockholders", "net_income"],
+        "Operating Cash Flow": ["operatingCashflow", "operatingCashFlow"],
+        "Revenue": ["totalRevenue", "revenue"],
+        "EPS (Diluted)": ["trailingEps", "epsTrailingTwelveMonths"],
+        "Market Capitalization": ["marketCap"],
+        "Shares Outstanding": ["sharesOutstanding"],
+        "Share Price": ["currentPrice", "regularMarketPrice"],
+        "Total Debt": ["totalDebt"],
+        "Long-Term Debt": ["longTermDebt", "longTermDebtNonCurrent", "long_term_debt"],
+        "Short-Term Debt": ["shortTermDebt", "shortTermBorrowings"],
+        "EBIT": ["ebit"],
+        "EBITDA": ["ebitda"],
+        "Interest Expense": ["interestExpense"],
+        "Capital Expenditures": ["capitalExpenditures"],
+        "Gross Margin": ["grossMargins"],
+        "Operating Margin": ["operatingMargins"],
+        "Profit Margin": ["profitMargins"],
+    }
+
+    try:
+        # Only attempt to fill from Yahoo for keys that remain None
+        for metric, info_keys in YF_FALLBACKS.items():
+            if data.get(metric) is not None:
+                continue
+            for ik in info_keys:
+                v = info.get(ik)
+                if v is not None:
+                    # Convert margins to percentages where appropriate (consistent with earlier logic)
+                    if metric in {"Gross Margin", "Operating Margin", "Profit Margin"}:
+                        try:
+                            data[metric] = v * 100 if isinstance(v, (int, float)) else None
+                        except:
+                            data[metric] = None
+                    else:
+                        data[metric] = v
+                    break
+
+        # After filling raw values from Yahoo, recompute any ratios that are still None but now computable
+        # Recompute P/E
+        try:
+            if data.get("P/E") is None:
+                if data.get("Share Price") and data.get("EPS (Diluted)"):
+                    data["P/E"] = data["Share Price"] / data["EPS (Diluted)"]
+        except:
+            data["P/E"] = data.get("P/E")
+
+        # PB Ratio
+        try:
+            if data.get("PB Ratio") is None:
+                if data.get("Share Price") and data.get("Shareholders' Equity") and data.get("Shares Outstanding"):
+                    data["PB Ratio"] = data["Share Price"] / (data["Shareholders' Equity"] / data["Shares Outstanding"])
+        except:
+            data["PB Ratio"] = data.get("PB Ratio")
+
+        # PS Ratio
+        try:
+            if data.get("PS Ratio") is None:
+                if data.get("Market Capitalization") and data.get("Revenue"):
+                    data["PS Ratio"] = data["Market Capitalization"] / data["Revenue"]
+        except:
+            data["PS Ratio"] = data.get("PS Ratio")
+
+        # Debt / Equity
+        try:
+            if data.get("Debt / Equity Ratio") is None:
+                if data.get("Total Debt") and data.get("Shareholders' Equity"):
+                    data["Debt / Equity Ratio"] = data["Total Debt"] / data["Shareholders' Equity"]
+        except:
+            data["Debt / Equity Ratio"] = data.get("Debt / Equity Ratio")
+
+        # Current Ratio
+        try:
+            if data.get("Current Ratio") is None:
+                if data.get("Total Current Assets") and data.get("Total Current Liabilities"):
+                    data["Current Ratio"] = data["Total Current Assets"] / data["Total Current Liabilities"]
+        except:
+            data["Current Ratio"] = data.get("Current Ratio")
+
+        # Free Cash Flow Margin
+        try:
+            if data.get("Free Cash Flow Margin") is None:
+                if data.get("Free Cash Flow") and data.get("Revenue"):
+                    data["Free Cash Flow Margin"] = data["Free Cash Flow"] / data["Revenue"] * 100
+        except:
+            data["Free Cash Flow Margin"] = data.get("Free Cash Flow Margin")
+
+        # ROE / ROA
+        try:
+            if data.get("Return on Equity (ROE)") is None:
+                if data.get("Net Income") and data.get("Shareholders' Equity"):
+                    data["Return on Equity (ROE)"] = data["Net Income"] / data["Shareholders' Equity"] * 100
+        except:
+            data["Return on Equity (ROE)"] = data.get("Return on Equity (ROE)")
+
+        try:
+            if data.get("Return on Assets (ROA)") is None:
+                if data.get("Net Income") and data.get("Total Assets"):
+                    data["Return on Assets (ROA)"] = data["Net Income"] / data["Total Assets"] * 100
+        except:
+            data["Return on Assets (ROA)"] = data.get("Return on Assets (ROA)")
+
+        # EBIT Margin
+        try:
+            if data.get("EBIT Margin") is None:
+                if data.get("EBIT") and data.get("Revenue"):
+                    data["EBIT Margin"] = data["EBIT"] / data["Revenue"] * 100
+        except:
+            data["EBIT Margin"] = data.get("EBIT Margin")
+
+        # Debt / EBITDA - recompute if still None and possible
+        try:
+            if data.get("Debt / EBITDA Ratio") is None:
+                ebitda = data.get("EBITDA") or data.get("EBIT") or data.get("Operating Income (EBIT)")
+                total_debt = data.get("Total Debt") or ((data.get("Long-Term Debt") or 0) + (data.get("Short-Term Debt") or 0)) or info.get("totalDebt", 0)
+                if ebitda and ebitda != 0 and total_debt and total_debt != 0:
+                    data["Debt / EBITDA Ratio"] = total_debt / ebitda
+                else:
+                    # Try final Yahoo-derived estimate: derived_ebitda = ebit + depreciation
+                    yf_ebit = info.get("ebit") or 0
+                    yf_dep = info.get("depreciation") or 0
+                    derived_ebitda = yf_ebit + yf_dep
+                    yf_total_debt = info.get("totalDebt") or 0
+                    if derived_ebitda != 0 and yf_total_debt:
+                        data["Debt / EBITDA Ratio"] = yf_total_debt / derived_ebitda
+        except:
+            data["Debt / EBITDA Ratio"] = data.get("Debt / EBITDA Ratio")
+    except Exception as e:
+        print(f"Error filling final yfinance fallbacks for {ticker}: {e}")
 
     # Additional, possible ratios and metrics can be restored using similar logic
 
