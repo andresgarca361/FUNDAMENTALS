@@ -56,6 +56,21 @@ def fetch_tag(base_url, headers, tag_list):
         sleep(0.15)
     return None, None
 
+# Bank detection helper (uses Yahoo Finance sector/industry)
+def is_bank(ticker):
+    try:
+        info = yf.Ticker(ticker).info or {}
+        sector = info.get("sector", "") or ""
+        industry = info.get("industry", "") or ""
+        if "Financial Services" in sector:
+            return True
+        for word in ["Bank", "Capital Markets", "Diversified Financial", "Insurance"]:
+            if word in industry:
+                return True
+        return False
+    except Exception:
+        return False
+
 # -------------- DATA FETCH + CALC --------------
 def fetch_and_cache_fundamentals(ticker):
     """Fetch new fundamentals and store in cache"""
@@ -66,6 +81,7 @@ def fetch_and_cache_fundamentals(ticker):
     base_url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/"
     headers = {"User-Agent": "Andres Garcia (30andgarcia@yourdomain.com)"}
 
+    # Original (corporate) tag mapping
     tags = {
         "Total Assets": ["Assets"],
         "Total Liabilities": ["Liabilities"],
@@ -89,12 +105,37 @@ def fetch_and_cache_fundamentals(ticker):
         "Dividends Paid": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
     }
 
+    # Verified tag fallbacks (bank-specific and universal helpers)
+    FALLBACK_TAGS = {
+        # Universal (works for all)
+        "Total Assets": ["Assets"],
+        "Total Liabilities": ["Liabilities"],
+        "Shareholders' Equity": ["StockholdersEquity"],
+        "Net Income": ["NetIncomeLoss", "ProfitLoss"],
+        "Operating Cash Flow": ["NetCashProvidedByUsedInOperatingActivities"],
+
+        # Bank-specific overrides (use these if is_bank=True)
+        "Revenue": ["InterestIncomeOperating", "InterestAndDividendIncomeOperating", "Revenues", "NoninterestIncome"],
+        "Gross Profit": ["InterestIncomeOperating", "InterestAndDividendIncomeOperating"],  # Proxy: interest income
+        "Operating Income (EBIT)": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItems", "IncomeBeforeIncomeTaxes"],
+        "EBIT": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItems"],
+        "EBITDA": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItems"],  # Banks don't have true EBITDA—use pre-tax as proxy
+        "Interest Expense": ["InterestAndDebtExpense", "InterestExpense"],
+        # Non-bank defaults remain in `tags` above
+    }
+
     data = {}
-    for k, v in tags.items():
-        val, _ = fetch_tag(base_url, headers, v)
+    # Use original tags keys to preserve metrics; pick tag lists dynamically by bank vs non-bank
+    for k in tags.keys():
+        if is_bank(ticker):
+            # Prefer explicit bank fallbacks when available, else fall back to original corporate tags
+            tag_list = FALLBACK_TAGS.get(k, tags.get(k, []))
+        else:
+            tag_list = tags.get(k, [])
+        val, _ = fetch_tag(base_url, headers, tag_list)
         data[k] = val
         if val is None:
-            print(f"⚠️ Could not fetch {k} for {ticker}")
+            print(f"⚠️ Could not fetch {k} for {ticker} (tried {tag_list})")
 
     # Yahoo Finance supplement
     yf_tkr = yf.Ticker(ticker)
@@ -170,6 +211,17 @@ def fetch_and_cache_fundamentals(ticker):
         data["EBIT Margin"] = data["EBIT"] / data["Revenue"] * 100 if data.get("EBIT") and data.get("Revenue") else None
     except:
         data["EBIT Margin"] = None
+
+    # Debt / EBITDA - null-safe and bank-aware proxying
+    try:
+        ebitda = data.get("EBITDA") or data.get("EBIT") or data.get("Operating Income (EBIT)")
+        total_debt = data.get("Total Debt") or ((data.get("Long-Term Debt") or 0) + (data.get("Short-Term Debt") or 0))
+        if ebitda and total_debt and ebitda != 0:
+            data["Debt / EBITDA Ratio"] = total_debt / ebitda
+        else:
+            data["Debt / EBITDA Ratio"] = None
+    except:
+        data["Debt / EBITDA Ratio"] = None
 
     # Additional, possible ratios and metrics can be restored using similar logic
 
