@@ -71,6 +71,36 @@ def is_bank(ticker):
     except Exception:
         return False
 
+# helper to extract value from yfinance DataFrames safely
+def _get_df_value(df, candidates):
+    try:
+        if df is None:
+            return None
+        # pandas DataFrame like object: index contains line items, columns are periods
+        idxs = list(getattr(df, "index", []))
+        for c in candidates:
+            # direct match
+            if c in idxs:
+                try:
+                    val = df.loc[c].values[0]
+                    if val is not None:
+                        return val
+                except Exception:
+                    pass
+            # case-insensitive match
+            lower = [str(i).lower() for i in idxs]
+            try:
+                if c.lower() in lower:
+                    match = idxs[lower.index(c.lower())]
+                    val = df.loc[match].values[0]
+                    if val is not None:
+                        return val
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+
 # -------------- DATA FETCH + CALC --------------
 def fetch_and_cache_fundamentals(ticker):
     """Fetch new fundamentals and store in cache"""
@@ -276,51 +306,64 @@ def fetch_and_cache_fundamentals(ticker):
         print(f"Error calculating Debt/EBITDA for {ticker}: {e}")
         data["Debt / EBITDA Ratio"] = None
 
-    # ---------------- FINAL ROBUST YFINANCE FALLBACK (only fill remaining None values) ----------------
-    # Map of metric -> possible yfinance info keys (try in order). Fill only when metric is None.
-    YF_FALLBACKS = {
-        "Total Assets": ["totalAssets", "total_assets"],
-        "Total Liabilities": ["totalLiab", "totalLiabilities", "total_liabilities"],
-        "Shareholders' Equity": ["totalStockholderEquity", "stockholdersEquity", "totalEquity"],
-        "Net Income": ["netIncome", "netIncomeToCommonStockholders", "net_income"],
-        "Operating Cash Flow": ["operatingCashflow", "operatingCashFlow"],
-        "Revenue": ["totalRevenue", "revenue"],
-        "EPS (Diluted)": ["trailingEps", "epsTrailingTwelveMonths"],
-        "Market Capitalization": ["marketCap"],
-        "Shares Outstanding": ["sharesOutstanding"],
-        "Share Price": ["currentPrice", "regularMarketPrice"],
-        "Total Debt": ["totalDebt"],
-        "Long-Term Debt": ["longTermDebt", "longTermDebtNonCurrent", "long_term_debt"],
-        "Short-Term Debt": ["shortTermDebt", "shortTermBorrowings"],
-        "EBIT": ["ebit"],
-        "EBITDA": ["ebitda"],
-        "Interest Expense": ["interestExpense"],
-        "Capital Expenditures": ["capitalExpenditures"],
-        "Gross Margin": ["grossMargins"],
-        "Operating Margin": ["operatingMargins"],
-        "Profit Margin": ["profitMargins"],
-    }
-
+    # ---------------- FINAL ROBUST YFINANCE RAW-FRAME FALLBACK (only fill remaining None values) ----------------
+    # This final fallback will attempt direct yfinance DataFrame pulls (financials / balance_sheet / cashflow)
+    # and only overwrite metrics that remain None after SEC + info-derived attempts.
     try:
-        # Only attempt to fill from Yahoo for keys that remain None
-        for metric, info_keys in YF_FALLBACKS.items():
+        # Pull raw yfinance dataframes once
+        try:
+            fin_df = yf_tkr.financials if hasattr(yf_tkr, "financials") else None
+        except Exception:
+            fin_df = None
+        try:
+            bal_df = yf_tkr.balance_sheet if hasattr(yf_tkr, "balance_sheet") else None
+        except Exception:
+            bal_df = None
+        try:
+            cf_df = yf_tkr.cashflow if hasattr(yf_tkr, "cashflow") else None
+        except Exception:
+            cf_df = None
+
+        # Map metrics to (df_source, possible row names)
+        YF_RAW_MAP = {
+            "Total Assets": ("bal", ["Total Assets", "totalAssets", "TotalAssets"]),
+            "Total Liabilities": ("bal", ["Total Liab", "Total Liabilities", "totalLiab", "TotalLiabilities"]),
+            "Shareholders' Equity": ("bal", ["Total Stockholder Equity", "Total Stockholders' Equity", "totalStockholderEquity", "stockholdersEquity"]),
+            "Net Income": ("fin", ["Net Income", "NetIncomeLoss", "netIncome"]),
+            "Operating Cash Flow": ("cf", ["Total Cash From Operating Activities", "Total cash from operating activities", "operatingCashflow", "Net Cash Provided by Operating Activities"]),
+            "Revenue": ("fin", ["Total Revenue", "TotalRevenue", "Revenues", "salesRevenueNet"]),
+            "EBIT": ("fin", ["Ebit", "EBIT", "Operating Income", "OperatingIncomeLoss"]),
+            "EBITDA": ("fin", ["Ebitda", "EBITDA"]),
+            "Long-Term Debt": ("bal", ["Long Term Debt", "LongTermDebt", "LongTermDebtNoncurrent"]),
+            "Short-Term Debt": ("bal", ["Short Term Debt", "ShortTermDebt", "Short Term Borrowings", "ShortTermBorrowings"]),
+            "Capital Expenditures": ("cf", ["Capital Expenditures", "CapitalExpenditures", "PaymentsToAcquirePropertyPlantAndEquipment"]),
+            "Free Cash Flow": ("cf", ["Free Cash Flow", "FreeCashFlow", "freeCashflow", "FreeCashFlowFromContinuingOperations"])
+        }
+
+        # Try filling from raw frames for any metric still None
+        for metric, (src, names) in YF_RAW_MAP.items():
             if data.get(metric) is not None:
                 continue
-            for ik in info_keys:
-                v = info.get(ik)
-                if v is not None:
-                    # Convert margins to percentages where appropriate (consistent with earlier logic)
-                    if metric in {"Gross Margin", "Operating Margin", "Profit Margin"}:
-                        try:
-                            data[metric] = v * 100 if isinstance(v, (int, float)) else None
-                        except:
-                            data[metric] = None
-                    else:
-                        data[metric] = v
-                    break
+            if src == "fin":
+                v = _get_df_value(fin_df, names)
+            elif src == "bal":
+                v = _get_df_value(bal_df, names)
+            elif src == "cf":
+                v = _get_df_value(cf_df, names)
+            else:
+                v = None
+            if v is not None:
+                data[metric] = v
 
-        # After filling raw values from Yahoo, recompute any ratios that are still None but now computable
-        # Recompute P/E
+        # Also ensure simple keys like marketCap/sharePrice are filled from info if still None
+        if data.get("Market Capitalization") is None:
+            data["Market Capitalization"] = info.get("marketCap")
+        if data.get("Share Price") is None:
+            data["Share Price"] = info.get("currentPrice") or info.get("regularMarketPrice")
+        if data.get("Shares Outstanding") is None:
+            data["Shares Outstanding"] = info.get("sharesOutstanding")
+
+        # After pulling raw frames, recompute derived metrics where possible (same recomputes as before)
         try:
             if data.get("P/E") is None:
                 if data.get("Share Price") and data.get("EPS (Diluted)"):
@@ -328,7 +371,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["P/E"] = data.get("P/E")
 
-        # PB Ratio
         try:
             if data.get("PB Ratio") is None:
                 if data.get("Share Price") and data.get("Shareholders' Equity") and data.get("Shares Outstanding"):
@@ -336,7 +378,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["PB Ratio"] = data.get("PB Ratio")
 
-        # PS Ratio
         try:
             if data.get("PS Ratio") is None:
                 if data.get("Market Capitalization") and data.get("Revenue"):
@@ -344,7 +385,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["PS Ratio"] = data.get("PS Ratio")
 
-        # Debt / Equity
         try:
             if data.get("Debt / Equity Ratio") is None:
                 if data.get("Total Debt") and data.get("Shareholders' Equity"):
@@ -352,7 +392,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["Debt / Equity Ratio"] = data.get("Debt / Equity Ratio")
 
-        # Current Ratio
         try:
             if data.get("Current Ratio") is None:
                 if data.get("Total Current Assets") and data.get("Total Current Liabilities"):
@@ -360,7 +399,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["Current Ratio"] = data.get("Current Ratio")
 
-        # Free Cash Flow Margin
         try:
             if data.get("Free Cash Flow Margin") is None:
                 if data.get("Free Cash Flow") and data.get("Revenue"):
@@ -368,7 +406,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["Free Cash Flow Margin"] = data.get("Free Cash Flow Margin")
 
-        # ROE / ROA
         try:
             if data.get("Return on Equity (ROE)") is None:
                 if data.get("Net Income") and data.get("Shareholders' Equity"):
@@ -383,7 +420,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["Return on Assets (ROA)"] = data.get("Return on Assets (ROA)")
 
-        # EBIT Margin
         try:
             if data.get("EBIT Margin") is None:
                 if data.get("EBIT") and data.get("Revenue"):
@@ -391,7 +427,7 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["EBIT Margin"] = data.get("EBIT Margin")
 
-        # Debt / EBITDA - recompute if still None and possible
+        # Debt / EBITDA - recompute if still None and possible after raw-frame pulls
         try:
             if data.get("Debt / EBITDA Ratio") is None:
                 ebitda = data.get("EBITDA") or data.get("EBIT") or data.get("Operating Income (EBIT)")
@@ -399,7 +435,6 @@ def fetch_and_cache_fundamentals(ticker):
                 if ebitda and ebitda != 0 and total_debt and total_debt != 0:
                     data["Debt / EBITDA Ratio"] = total_debt / ebitda
                 else:
-                    # Try final Yahoo-derived estimate: derived_ebitda = ebit + depreciation
                     yf_ebit = info.get("ebit") or 0
                     yf_dep = info.get("depreciation") or 0
                     derived_ebitda = yf_ebit + yf_dep
@@ -408,8 +443,24 @@ def fetch_and_cache_fundamentals(ticker):
                         data["Debt / EBITDA Ratio"] = yf_total_debt / derived_ebitda
         except:
             data["Debt / EBITDA Ratio"] = data.get("Debt / EBITDA Ratio")
+
+        # Final compute for FCF Yield (null-safe) - derived from raw frames or info
+        try:
+            if data.get("FCF Yield") is None:
+                fcf = data.get("Free Cash Flow")
+                if not fcf:
+                    # try cashflow df names already tried above; fall back to info
+                    fcf = info.get("freeCashflow") or info.get("freeCashFlow") or info.get("free_cashflow") or info.get("freeCashFlowFromContinuingOperations")
+                mktcap = data.get("Market Capitalization") or info.get("marketCap") or info.get("market_cap")
+                if fcf and mktcap and mktcap != 0:
+                    data["FCF Yield"] = (fcf / mktcap) * 100
+                else:
+                    data["FCF Yield"] = None
+        except:
+            data["FCF Yield"] = None
+
     except Exception as e:
-        print(f"Error filling final yfinance fallbacks for {ticker}: {e}")
+        print(f"Error filling final yfinance raw-frame fallbacks for {ticker}: {e}")
 
     # Additional, possible ratios and metrics can be restored using similar logic
 
