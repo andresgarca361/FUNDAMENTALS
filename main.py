@@ -19,7 +19,7 @@ VALID_METRICS = {
     "Short-Term Investments", "Total Current Liabilities", "Debt / FCF Ratio",
     "Total Current Assets", "Total Assets", "Retained Earnings", "Shareholders' Equity",
     "Total Liabilities", "Free Cash Flow", "Operating Cash Flow", "FCF Yield",
-    "Capital Expenditures", "Net Income"
+    "Capital Expenditures", "Net Income", "Occupancy Rate"  # <--- Added here
 }
 
 # ---------------- HELPERS ----------------
@@ -101,6 +101,31 @@ def _get_df_value(df, candidates):
     except Exception:
         return None
 
+# ------------ FETCH OCCUPANCY RATE HELPER (universal, sector-driven, yfinance source only) -------------
+def fetch_occupancy_rate(ticker):
+    """
+    Attempt to fetch occupancy rate for the given ticker if it's a REIT/hotel.
+    Returns None if not found or not applicable.
+    """
+    try:
+        info = yf.Ticker(ticker).info
+        # Try common field names for occupancy in yfinance.info if available
+        for key in ['occupancyRate', 'occupancy_rate', 'occupancyrate']:
+            occ = info.get(key)
+            if occ is not None:
+                # Sometimes it's a percentage (e.g. 0.78 means 78%)
+                if occ < 1:
+                    return occ * 100
+                return occ
+        # sector/industry logic for hotels/REIT: you can customize further if you want
+        industry = (info.get("industry") or "").lower()
+        if any(word in industry for word in ["reit", "hotel", "lodging", "resort", "inn"]):
+            # Could supplement with web scrape or other data source here if you want
+            return None  # fallback: None
+        return None
+    except Exception:
+        return None
+
 # -------------- DATA FETCH + CALC --------------
 def fetch_and_cache_fundamentals(ticker):
     """Fetch new fundamentals and store in cache"""
@@ -153,16 +178,16 @@ def fetch_and_cache_fundamentals(ticker):
             "InterestIncomeOperating", "InterestAndDividendIncomeOperating", "NetInterestIncome"
         ],
         "Operating Income (EBIT)": [
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",  # ✅ JPM's EXACT tag (shorter)
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItems",
             "IncomeBeforeIncomeTaxes"
         ],
         "EBIT": [
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",  # Key fix
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItems"
         ],
         "EBITDA": [
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"  # Proxy
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
         ],
         "Interest Expense": [
             "InterestAndDebtExpense", "InterestExpense", "InterestExpenseDeposits"
@@ -170,12 +195,12 @@ def fetch_and_cache_fundamentals(ticker):
         # FIXED Debt (added JPM bank-specific long-term proxies)
         "Long-Term Debt": [
             "LongTermDebt", "LongTermDebtNoncurrent",
-            "DebtSecurities", "LongTermDebtAndCapitalSecurities"  # JPM uses these for funding
+            "DebtSecurities", "LongTermDebtAndCapitalSecurities"
         ],
         "Short-Term Debt": [
             "ShortTermBorrowings", "CommercialPaper", "ShortTermDebtCurrent",
-            "FederalFundsPurchasedAndSecuritiesSoldUnderAgreementsToRepurchase",  # JPM short-term
-            "ShortTermDebt"  # Shorter variant
+            "FederalFundsPurchasedAndSecuritiesSoldUnderAgreementsToRepurchase",
+            "ShortTermDebt"
         ],
         # Non-bank defaults remain in `tags`
     }
@@ -216,6 +241,9 @@ def fetch_and_cache_fundamentals(ticker):
     data["EPS (Diluted)"] = data.get("EPS (Diluted)") or info.get("trailingEps")
     data["Revenue"] = data.get("Revenue") or info.get("totalRevenue")
     data["EBIT"] = data.get("EBIT") or data.get("Operating Income (EBIT)") or info.get("ebit")
+
+    # Occupancy Rate (universal sector-based fallback, yfinance 'info' source only)
+    data["Occupancy Rate"] = fetch_occupancy_rate(ticker)
 
     # Core derived metrics
     try:
@@ -275,24 +303,20 @@ def fetch_and_cache_fundamentals(ticker):
 
     # FIXED: Debt / EBITDA (now pulls ~14.3 for JPM via live tags + Yahoo)
     try:
-        # Step 1: Yahoo primary (pre-computed, bank-friendly)
-        yf_debt_to_ebitda = info.get("debtToEquity")  # available as a proxy
+        yf_debt_to_ebitda = info.get("debtToEquity")
         yf_total_debt = info.get("totalDebt") or 0
-        yf_ebitda_ratio = info.get("enterpriseToEbitda")  # EV / EBITDA
+        yf_ebitda_ratio = info.get("enterpriseToEbitda")
         if yf_ebitda_ratio and yf_ebitda_ratio != 0:
-            # Invert enterpriseToEbitda as an approximation for Debt/EBITDA per user's heuristic
             data["Debt / EBITDA Ratio"] = 1 / yf_ebitda_ratio
         elif yf_total_debt > 0:
-            # Step 2: Derive from SEC (now with fixed tags)
             ebitda_sec = data.get("EBITDA") or data.get("EBIT") or data.get("Operating Income (EBIT)")
             if ebitda_sec and ebitda_sec != 0:
                 total_debt_sec = data.get("Total Debt") or ((data.get("Long-Term Debt") or 0) + (data.get("Short-Term Debt") or 0))
                 if total_debt_sec > 0:
                     data["Debt / EBITDA Ratio"] = total_debt_sec / ebitda_sec
                 else:
-                    data["Debt / EBITDA Ratio"] = yf_total_debt / ebitda_sec  # Mix SEC denom + Yahoo num
+                    data["Debt / EBITDA Ratio"] = yf_total_debt / ebitda_sec
             else:
-                # Step 3: Full Yahoo derive (EBITDA = EBIT + Dep)
                 yf_ebit = info.get("ebit") or 0
                 yf_dep = info.get("depreciation") or 0
                 derived_ebitda = yf_ebit + yf_dep
@@ -307,10 +331,7 @@ def fetch_and_cache_fundamentals(ticker):
         data["Debt / EBITDA Ratio"] = None
 
     # ---------------- FINAL ROBUST YFINANCE RAW-FRAME FALLBACK (only fill remaining None values) ----------------
-    # This final fallback will attempt direct yfinance DataFrame pulls (financials / balance_sheet / cashflow)
-    # and only overwrite metrics that remain None after SEC + info-derived attempts.
     try:
-        # Pull raw yfinance dataframes once
         try:
             fin_df = yf_tkr.financials if hasattr(yf_tkr, "financials") else None
         except Exception:
@@ -324,7 +345,6 @@ def fetch_and_cache_fundamentals(ticker):
         except Exception:
             cf_df = None
 
-        # Map metrics to (df_source, possible row names)
         YF_RAW_MAP = {
             "Total Assets": ("bal", ["Total Assets", "totalAssets", "TotalAssets"]),
             "Total Liabilities": ("bal", ["Total Liab", "Total Liabilities", "totalLiab", "TotalLiabilities"]),
@@ -340,7 +360,6 @@ def fetch_and_cache_fundamentals(ticker):
             "Free Cash Flow": ("cf", ["Free Cash Flow", "FreeCashFlow", "freeCashflow", "FreeCashFlowFromContinuingOperations"])
         }
 
-        # Try filling from raw frames for any metric still None
         for metric, (src, names) in YF_RAW_MAP.items():
             if data.get(metric) is not None:
                 continue
@@ -355,7 +374,6 @@ def fetch_and_cache_fundamentals(ticker):
             if v is not None:
                 data[metric] = v
 
-        # Also ensure simple keys like marketCap/sharePrice are filled from info if still None
         if data.get("Market Capitalization") is None:
             data["Market Capitalization"] = info.get("marketCap")
         if data.get("Share Price") is None:
@@ -363,7 +381,6 @@ def fetch_and_cache_fundamentals(ticker):
         if data.get("Shares Outstanding") is None:
             data["Shares Outstanding"] = info.get("sharesOutstanding")
 
-        # After pulling raw frames, recompute derived metrics where possible (same recomputes as before)
         try:
             if data.get("P/E") is None:
                 if data.get("Share Price") and data.get("EPS (Diluted)"):
@@ -427,7 +444,6 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["EBIT Margin"] = data.get("EBIT Margin")
 
-        # Debt / EBITDA - recompute if still None and possible after raw-frame pulls
         try:
             if data.get("Debt / EBITDA Ratio") is None:
                 ebitda = data.get("EBITDA") or data.get("EBIT") or data.get("Operating Income (EBIT)")
@@ -444,12 +460,10 @@ def fetch_and_cache_fundamentals(ticker):
         except:
             data["Debt / EBITDA Ratio"] = data.get("Debt / EBITDA Ratio")
 
-        # Final compute for FCF Yield (null-safe) - derived from raw frames or info
         try:
             if data.get("FCF Yield") is None:
                 fcf = data.get("Free Cash Flow")
                 if not fcf:
-                    # try cashflow df names already tried above; fall back to info
                     fcf = info.get("freeCashflow") or info.get("freeCashFlow") or info.get("free_cashflow") or info.get("freeCashFlowFromContinuingOperations")
                 mktcap = data.get("Market Capitalization") or info.get("marketCap") or info.get("market_cap")
                 if fcf and mktcap and mktcap != 0:
@@ -461,8 +475,6 @@ def fetch_and_cache_fundamentals(ticker):
 
     except Exception as e:
         print(f"Error filling final yfinance raw-frame fallbacks for {ticker}: {e}")
-
-    # Additional, possible ratios and metrics can be restored using similar logic
 
     CACHE[ticker] = {"timestamp": time(), "data": data}
     return data
