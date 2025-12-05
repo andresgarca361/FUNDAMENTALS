@@ -506,3 +506,219 @@ def get_metric():
 # -------------- RUN --------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+
+
+# app.py ← Flask API for REIT Occupancy Rate
+from flask import Flask, jsonify, request
+import requests
+from bs4 import BeautifulSoup
+import re
+import warnings
+from bs4 import XMLParsedAsHTMLWarning
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+app = Flask(__name__)
+
+def get_occupancy_rate(ticker):
+    ticker = ticker.upper().strip()
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/130.0 Safari/537.36 your.real.email@gmail.com',
+    }
+
+    # 1. Get CIK
+    try:
+        data = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=15).json()
+        cik = next((str(v['cik_str']).zfill(10) for v in data.values() if v['ticker'].upper() == ticker), None)
+        if not cik:
+            return {"error": "Ticker not found", "ticker": ticker}
+    except Exception as e:
+        return {"error": "SEC blocked request — use real email in User-Agent", "ticker": ticker}
+
+    # 2. Get latest 10-Q then 10-K
+    try:
+        filings = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=headers).json()
+    except:
+        return {"error": "Failed to fetch filings", "ticker": ticker}
+    
+    forms = filings['filings']['recent']['form']
+    accs = filings['filings']['recent']['accessionNumber']
+    docs = filings['filings']['recent']['primaryDocument']
+
+    filing_urls = []
+    for i, form in enumerate(forms):
+        if form in ('10-Q', '10-K'):
+            acc = accs[i].replace('-', '')
+            url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{docs[i]}"
+            filing_urls.append((form, url))
+            if len(filing_urls) >= 3:  # Up to 3 filings
+                break
+
+    if not filing_urls:
+        return {"error": "No recent filings found", "ticker": ticker}
+
+    # 3. Try each filing
+    for form_type, url in filing_urls:
+        try:
+            html = requests.get(url, headers=headers, timeout=20).text
+        except:
+            continue
+
+        soup = BeautifulSoup(html, 'html5lib')
+
+        # METHOD 1: XBRL – broader context
+        for tag in soup.find_all(['ix:nonfraction', 'ix:nonFraction']):
+            context = tag.get('contextref', '')
+            if 'current' not in context.lower() and 'asof' not in context.lower():
+                continue
+            # Grandparent + parent for full context
+            gp_text = tag.parent.parent.get_text() if tag.parent and tag.parent.parent else ''
+            parent_text = (gp_text + ' ' + (tag.parent.get_text() if tag.parent else '')).strip()
+            if any(kw in parent_text.lower() for kw in ['occupancy', 'leased', 'percent leased', 'portfolio', 'properties leased']):
+                num = tag.get_text(strip=True).replace(',', '')
+                if re.match(r'^\d+\.?\d*$', num):
+                    perc = float(num)
+                    if 50 <= perc <= 100:
+                        return {
+                            "ticker": ticker,
+                            "occupancy_rate": round(perc, 2),
+                            "source": f"XBRL ({form_type})",
+                            "context": parent_text,
+                            "filing_url": url
+                        }
+
+        # METHOD 2: Text + Table – FIXED FOR FULL SENTENCES
+        text = soup.get_text(separator=' ')
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'(\d+)\s*\.\s*(\d+)\s*(%)', r'\1.\2\3', text)  # 96 . 9 % → 96.9%
+        text = re.sub(r'(\d+)\s*\.\s*(\d+)', r'\1.\2', text)
+
+        # Table extraction for NNN/WPC-style summaries
+        table_pattern = r'(?:percent|percentage)\s+leased.*?(\d+\.?\d*)\s*(%|percent)'
+        table_matches = re.findall(table_pattern, text, re.IGNORECASE)
+        if table_matches:
+            for tm in table_matches:
+                perc_num = float(tm[0])
+                if 90 <= perc_num <= 100:  # High % only for tables
+                    return {
+                        "ticker": ticker,
+                        "occupancy_rate": round(perc_num, 1),
+                        "source": f"TABLE ({form_type})",
+                        "context": f"Percent leased: {perc_num:.1f}% (from portfolio summary)",
+                        "filing_url": url
+                    }
+
+        # Patterns – prioritize STAG-style "decreased to X.X%"
+        patterns = [
+            r'decreased\s+(?:approximately\s+)?\d+\.?\d*%\s+to\s+(\d+\.?\d*)%',  # STAG priority
+            r'increased\s+(?:approximately\s+)?\d+\.?\d*%\s+to\s+(\d+\.?\d*)%',
+            r'percent\s+leased\s*(?:was|is|remained|stood)?\s*[:\-]?\s*(\d+\.?\d*)%',
+            r'percentage\s+leased\s*(?:was|is|remained|stood)?\s*[:\-]?\s*(\d+\.?\d*)%',
+            r'properties.*?leased.*?(\d+\.?\d*)%',
+            r'leased\s*(?:was|is|stood)?\s*[:\-]?\s*(\d+\.?\d*)%',
+            r'occupancy\s*(?:was|is|stood|remained)?\s*[:\-]?\s*(\d+\.?\d*)%',
+            r'portfolio\s+(?:was|is)\s+(\d+\.?\d*)%\s+(?:leased|occupied)',
+            r'(\d+\.?\d*)%\s+(?:leased|occupied)',
+            r'(\d+\.?\d*)%\s+of\s+our\s+(?:properties|portfolio)',
+            r'same\s*store[^.?!]{0,1000}(\d+\.?\d*)%',  # Extra long for STAG
+        ]
+
+        candidates = []
+        for pattern in patterns:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                perc = m.group(1)
+                try:
+                    perc_num = float(perc)
+                except:
+                    continue
+                if not (50 <= perc_num <= 100):
+                    continue
+                start = max(0, m.start() - 1000)  # Max context
+                end = min(len(text), m.end() + 1000)
+                context = text[start:end]
+                sentences = re.split(r'[.?!]', context)
+                sentence = sentences[0] + '.'
+                # Grab longest relevant sentence if first is junk
+                for s in sentences[:3]:
+                    if len(s) > 50 and any(kw in s.lower() for kw in ['occupancy', 'leased', 'portfolio']):
+                        sentence = s + '.'
+                        break
+                sentence_lower = sentence.lower()
+
+                if any(bad in sentence_lower for bad in [
+                    'definition', 'means', 'defined as', 'earlier of', 'achieving',
+                    'stabilization', 'threshold', 'minimum', 'target', 'expense', 'rent', 'cash basis'
+                ]):
+                    continue
+
+                score = 0
+                if 'same store' in sentence_lower: score += 10
+                if 'portfolio' in sentence_lower: score += 5
+                if 'as of' in sentence_lower or 'ended' in sentence_lower: score += 8
+                if 'leased' in sentence_lower or 'occupancy' in sentence_lower: score += 5
+                if 'decreased' in sentence_lower or 'increased' in sentence_lower: score += 3
+                if 'percent leased' in sentence_lower: score += 7
+
+                candidates.append((score, perc_num, sentence.strip()))
+
+        if candidates:
+            best = max(candidates, key=lambda x: (x[0], x[1]))
+            return {
+                "ticker": ticker,
+                "occupancy_rate": round(best[1], 2),
+                "source": f"TEXT ({form_type})",
+                "context": best[2],
+                "filing_url": url
+            }
+
+    return {"error": "No reliable rate found across recent filings", "ticker": ticker}
+
+@app.route('/api/occupancy/<ticker>', methods=['GET'])
+def api_occupancy(ticker):
+    """
+    GET /api/occupancy/<ticker>
+    Returns occupancy rate for the given REIT ticker
+    """
+    result = get_occupancy_rate(ticker)
+    
+    if "error" in result:
+        return jsonify(result), 404
+    
+    return jsonify(result), 200
+
+@app.route('/api/occupancy', methods=['POST'])
+def api_occupancy_post():
+    """
+    POST /api/occupancy
+    Body: {"ticker": "STAG"}
+    Returns occupancy rate for the given REIT ticker
+    """
+    data = request.get_json()
+    
+    if not data or 'ticker' not in data:
+        return jsonify({"error": "Missing 'ticker' in request body"}), 400
+    
+    ticker = data['ticker']
+    result = get_occupancy_rate(ticker)
+    
+    if "error" in result:
+        return jsonify(result), 404
+    
+    return jsonify(result), 200
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "message": "REIT Occupancy Rate API",
+        "endpoints": {
+            "GET /api/occupancy/<ticker>": "Get occupancy rate by ticker in URL",
+            "POST /api/occupancy": "Get occupancy rate by ticker in JSON body {'ticker': 'STAG'}"
+        },
+        "example": "/api/occupancy/STAG"
+    })
+
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
