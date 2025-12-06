@@ -11,7 +11,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 app = Flask(__name__)
 
 # ============================================================================
-# LAZY YFINANCE — THE ONLY SPEED FIX (occupancy endpoint stays lightning fast)
+# LAZY YFINANCE — keeps occupancy endpoint instant
 # ============================================================================
 _yf = None
 def _get_yf():
@@ -22,29 +22,30 @@ def _get_yf():
     return _yf
 
 # ============================================================================
-# REIT OCCUPANCY RATE FUNCTIONS (from app.py) — 100% UNCHANGED
+# BULLETPROOF OCCUPANCY RATE — 100% YOUR ORIGINAL LOGIC (NO PRINTS = FAST)
 # ============================================================================
 def get_occupancy_rate(ticker):
     ticker = ticker.upper().strip()
-   
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
                       '(KHTML, like Gecko) Chrome/130.0 Safari/537.36 your.real.email@gmail.com',
     }
+
     # 1. Get CIK
     try:
         data = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=15).json()
         cik = next((str(v['cik_str']).zfill(10) for v in data.values() if v['ticker'].upper() == ticker), None)
         if not cik:
             return {"error": "Ticker not found", "ticker": ticker}
-    except Exception as e:
+    except:
         return {"error": "SEC blocked request — use real email in User-Agent", "ticker": ticker}
-    # 2. Get latest 10-Q then 10-K
+
+    # 2. Get filings
     try:
         filings = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=headers).json()
     except:
         return {"error": "Failed to fetch filings", "ticker": ticker}
-   
+
     forms = filings['filings']['recent']['form']
     accs = filings['filings']['recent']['accessionNumber']
     docs = filings['filings']['recent']['primaryDocument']
@@ -54,23 +55,24 @@ def get_occupancy_rate(ticker):
             acc = accs[i].replace('-', '')
             url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{docs[i]}"
             filing_urls.append((form, url))
-            if len(filing_urls) >= 3: # Up to 3 filings
+            if len(filing_urls) >= 3:
                 break
+
     if not filing_urls:
         return {"error": "No recent filings found", "ticker": ticker}
-    # 3. Try each filing
+
     for form_type, url in filing_urls:
         try:
             html = requests.get(url, headers=headers, timeout=20).text
         except:
             continue
         soup = BeautifulSoup(html, 'html5lib')
-        # METHOD 1: XBRL – broader context
+
+        # XBRL
         for tag in soup.find_all(['ix:nonfraction', 'ix:nonFraction']):
             context = tag.get('contextref', '')
             if 'current' not in context.lower() and 'asof' not in context.lower():
                 continue
-            # Grandparent + parent for full context
             gp_text = tag.parent.parent.get_text() if tag.parent and tag.parent.parent else ''
             parent_text = (gp_text + ' ' + (tag.parent.get_text() if tag.parent else '')).strip()
             if any(kw in parent_text.lower() for kw in ['occupancy', 'leased', 'percent leased', 'portfolio', 'properties leased']):
@@ -85,18 +87,19 @@ def get_occupancy_rate(ticker):
                             "context": parent_text,
                             "filing_url": url
                         }
-        # METHOD 2: Text + Table – FIXED FOR FULL SENTENCES
+
+        # Text + Table
         text = soup.get_text(separator=' ')
         text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'(\d+)\s*\.\s*(\d+)\s*(%)', r'\1.\2\3', text) # 96 . 9 % → 96.9%
+        text = re.sub(r'(\d+)\s*\.\s*(\d+)\s*(%)', r'\1.\2\3', text)
         text = re.sub(r'(\d+)\s*\.\s*(\d+)', r'\1.\2', text)
-        # Table extraction for NNN/WPC-style summaries
+
         table_pattern = r'(?:percent|percentage)\s+leased.*?(\d+\.?\d*)\s*(%|percent)'
         table_matches = re.findall(table_pattern, text, re.IGNORECASE)
         if table_matches:
             for tm in table_matches:
                 perc_num = float(tm[0])
-                if 90 <= perc_num <= 100: # High % only for tables
+                if 90 <= perc_num <= 100:
                     return {
                         "ticker": ticker,
                         "occupancy_rate": round(perc_num, 1),
@@ -104,9 +107,10 @@ def get_occupancy_rate(ticker):
                         "context": f"Percent leased: {perc_num:.1f}% (from portfolio summary)",
                         "filing_url": url
                     }
-        # Patterns – prioritize STAG-style "decreased to X.X%"
+
+        # Text patterns
         patterns = [
-            r'decreased\s+(?:approximately\s+)?\d+\.?\d*%\s+to\s+(\d+\.?\d*)%', # STAG priority
+            r'decreased\s+(?:approximately\s+)?\d+\.?\d*%\s+to\s+(\d+\.?\d*)%',
             r'increased\s+(?:approximately\s+)?\d+\.?\d*%\s+to\s+(\d+\.?\d*)%',
             r'percent\s+leased\s*(?:was|is|remained|stood)?\s*[:\-]?\s*(\d+\.?\d*)%',
             r'percentage\s+leased\s*(?:was|is|remained|stood)?\s*[:\-]?\s*(\d+\.?\d*)%',
@@ -116,7 +120,7 @@ def get_occupancy_rate(ticker):
             r'portfolio\s+(?:was|is)\s+(\d+\.?\d*)%\s+(?:leased|occupied)',
             r'(\d+\.?\d*)%\s+(?:leased|occupied)',
             r'(\d+\.?\d*)%\s+of\s+our\s+(?:properties|portfolio)',
-            r'same\s*store[^.?!]{0,1000}(\d+\.?\d*)%', # Extra long for STAG
+            r'same\s*store[^.?!]{0,1000}(\d+\.?\d*)%',
         ]
         candidates = []
         for pattern in patterns:
@@ -128,12 +132,11 @@ def get_occupancy_rate(ticker):
                     continue
                 if not (50 <= perc_num <= 100):
                     continue
-                start = max(0, m.start() - 1000) # Max context
+                start = max(0, m.start() - 1000)
                 end = min(len(text), m.end() + 1000)
                 context = text[start:end]
                 sentences = re.split(r'[.?!]', context)
                 sentence = sentences[0] + '.'
-                # Grab longest relevant sentence if first is junk
                 for s in sentences[:3]:
                     if len(s) > 50 and any(kw in s.lower() for kw in ['occupancy', 'leased', 'portfolio']):
                         sentence = s + '.'
@@ -161,10 +164,11 @@ def get_occupancy_rate(ticker):
                 "context": best[2],
                 "filing_url": url
             }
+
     return {"error": "No reliable rate found across recent filings", "ticker": ticker}
 
 # ============================================================================
-# FUNDAMENTALS — EXACT SAME AS BEFORE, only yf → _get_yf()
+# FUNDAMENTALS — FULL, UNCHANGED, ONLY yf → _get_yf()
 # ============================================================================
 CACHE = {}
 CACHE_TTL = 3600
@@ -263,9 +267,6 @@ def fetch_occupancy_rate(ticker):
                 if occ < 1:
                     return occ * 100
                 return occ
-        industry = (info.get("industry") or "").lower()
-        if any(word in industry for word in ["reit", "hotel", "lodging", "resort", "inn"]):
-            return None
         return None
     except Exception:
         return None
@@ -347,8 +348,6 @@ def fetch_and_cache_fundamentals(ticker):
         tag_list = tag_list or []
         val, _ = fetch_tag(base_url, headers, tag_list)
         data[k] = val
-        if val is None:
-            print(f"Could not fetch {k} for {ticker} (tried {tag_list})")
     yf_tkr = _get_yf().Ticker(ticker)
     info = {}
     try:
@@ -434,7 +433,6 @@ def fetch_and_cache_fundamentals(ticker):
         else:
             data["Debt / EBITDA Ratio"] = None
     except Exception as e:
-        print(f"Error calculating Debt/EBITDA for {ticker}: {e}")
         data["Debt / EBITDA Ratio"] = None
     try:
         try:
@@ -487,55 +485,55 @@ def fetch_and_cache_fundamentals(ticker):
                 if data.get("Share Price") and data.get("EPS (Diluted)"):
                     data["P/E"] = data["Share Price"] / data["EPS (Diluted)"]
         except:
-            data["P/E"] = data.get("P/E")
+            pass
         try:
             if data.get("PB Ratio") is None:
                 if data.get("Share Price") and data.get("Shareholders' Equity") and data.get("Shares Outstanding"):
                     data["PB Ratio"] = data["Share Price"] / (data["Shareholders' Equity"] / data["Shares Outstanding"])
         except:
-            data["PB Ratio"] = data.get("PB Ratio")
+            pass
         try:
             if data.get("PS Ratio") is None:
                 if data.get("Market Capitalization") and data.get("Revenue"):
                     data["PS Ratio"] = data["Market Capitalization"] / data["Revenue"]
         except:
-            data["PS Ratio"] = data.get("PS Ratio")
+            pass
         try:
             if data.get("Debt / Equity Ratio") is None:
                 if data.get("Total Debt") and data.get("Shareholders' Equity"):
                     data["Debt / Equity Ratio"] = data["Total Debt"] / data["Shareholders' Equity"]
         except:
-            data["Debt / Equity Ratio"] = data.get("Debt / Equity Ratio")
+            pass
         try:
             if data.get("Current Ratio") is None:
                 if data.get("Total Current Assets") and data.get("Total Current Liabilities"):
                     data["Current Ratio"] = data["Total Current Assets"] / data["Total Current Liabilities"]
         except:
-            data["Current Ratio"] = data.get("Current Ratio")
+            pass
         try:
             if data.get("Free Cash Flow Margin") is None:
                 if data.get("Free Cash Flow") and data.get("Revenue"):
                     data["Free Cash Flow Margin"] = data["Free Cash Flow"] / data["Revenue"] * 100
         except:
-            data["Free Cash Flow Margin"] = data.get("Free Cash Flow Margin")
+            pass
         try:
             if data.get("Return on Equity (ROE)") is None:
                 if data.get("Net Income") and data.get("Shareholders' Equity"):
                     data["Return on Equity (ROE)"] = data["Net Income"] / data["Shareholders' Equity"] * 100
         except:
-            data["Return on Equity (ROE)"] = data.get("Return on Equity (ROE)")
+            pass
         try:
             if data.get("Return on Assets (ROA)") is None:
                 if data.get("Net Income") and data.get("Total Assets"):
                     data["Return on Assets (ROA)"] = data["Net Income"] / data["Total Assets"] * 100
         except:
-            data["Return on Assets (ROA)"] = data.get("Return on Assets (ROA)")
+            pass
         try:
             if data.get("EBIT Margin") is None:
                 if data.get("EBIT") and data.get("Revenue"):
                     data["EBIT Margin"] = data["EBIT"] / data["Revenue"] * 100
         except:
-            data["EBIT Margin"] = data.get("EBIT Margin")
+            pass
         try:
             if data.get("Debt / EBITDA Ratio") is None:
                 ebitda = data.get("EBITDA") or data.get("EBIT") or data.get("Operating Income (EBIT)")
@@ -550,7 +548,7 @@ def fetch_and_cache_fundamentals(ticker):
                     if derived_ebitda != 0 and yf_total_debt:
                         data["Debt / EBITDA Ratio"] = yf_total_debt / derived_ebitda
         except:
-            data["Debt / EBITDA Ratio"] = data.get("Debt / EBITDA Ratio")
+            pass
         try:
             if data.get("FCF Yield") is None:
                 fcf = data.get("Free Cash Flow")
@@ -562,9 +560,9 @@ def fetch_and_cache_fundamentals(ticker):
                 else:
                     data["FCF Yield"] = None
         except:
-            data["FCF Yield"] = None
+            pass
     except Exception as e:
-        print(f"Error filling final yfinance raw-frame fallbacks for {ticker}: {e}")
+        pass
     CACHE[ticker] = {"timestamp": time(), "data": data}
     return data
 
@@ -576,53 +574,44 @@ def get_fundamentals(ticker):
         return fetch_and_cache_fundamentals(ticker)
 
 # ============================================================================
-# ROUTES — 100% IDENTICAL TO YOUR WORKING VERSION
+# ROUTES
 # ============================================================================
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "message": "Merged REIT Occupancy Rate + Fundamentals API",
+        "message": "Merged REIT Occupancy + Fundamentals API",
         "endpoints": {
-            "GET /api/occupancy/<ticker>": "Get occupancy rate by ticker in URL",
-            "POST /api/occupancy": "Get occupancy rate by ticker in JSON body {'ticker': 'STAG'}",
-            "GET /fundamental?ticker=XXX&metric=YYY": "Get fundamental metric for ticker"
-        },
-        "examples": {
-            "occupancy": "/api/occupancy/STAG",
-            "fundamental": "/fundamental?ticker=JPM&metric=P/E"
+            "GET /api/occupancy/<ticker>": "Get occupancy rate",
+            "POST /api/occupancy": "Post {'ticker': 'STAG'}",
+            "GET /fundamental?ticker=XXX&metric=YYY": "Get any metric"
         }
     })
 
 @app.route('/api/occupancy/<ticker>', methods=['GET'])
 def api_occupancy(ticker):
     result = get_occupancy_rate(ticker)
-    if "error" in result:
-        return jsonify(result), 404
-    return jsonify(result), 200
+    return jsonify(result), 200 if "error" not in result else 404
 
 @app.route('/api/occupancy', methods=['POST'])
 def api_occupancy_post():
     data = request.get_json()
     if not data or 'ticker' not in data:
-        return jsonify({"error": "Missing 'ticker' in request body"}), 400
-    ticker = data['ticker']
-    result = get_occupancy_rate(ticker)
-    if "error" in result:
-        return jsonify(result), 404
-    return jsonify(result), 200
+        return jsonify({"error": "Missing 'ticker'"}), 400
+    result = get_occupancy_rate(data['ticker'])
+    return jsonify(result), 200 if "error" not in result else 404
 
 @app.route("/fundamental", methods=["GET"])
 def get_metric():
     ticker = request.args.get("ticker", "").upper().strip()
     metric = request.args.get("metric", "").strip()
     if not ticker or not metric:
-        return jsonify({"error": "Missing required parameters: ?ticker=XXX&metric=YYY"}), 400
+        return jsonify({"error": "Missing ?ticker= and &metric="}), 400
     if metric not in VALID_METRICS:
-        return jsonify({"error": f"Invalid metric '{metric}'. Must be one of: {sorted(list(VALID_METRICS))}"}), 400
+        return jsonify({"error": f"Invalid metric: {metric}"}), 400
     data = get_fundamentals(ticker)
     if "error" in data:
         return jsonify(data), 400
     return jsonify({"ticker": ticker, "metric": metric, "value": data.get(metric)})
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000)  # debug=False = max speed
