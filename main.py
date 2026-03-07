@@ -351,6 +351,46 @@ def fetch_occupancy_rate(ticker):
     except Exception:
         return None
 
+
+
+def fetch_reit_metrics(ticker):
+    """
+    Fetch FFO, AFFO, P/FFO, AFFO Yield, Payout Ratio from SEC filings + yfinance
+    """
+    cik = get_cik(ticker)
+    if not cik:
+        return {}
+
+    net_income = get_sec_fact(cik, "NetIncomeLoss")
+    depreciation = get_sec_fact(cik, "DepreciationDepletionAndAmortization")
+    capex = get_sec_fact(cik, "PaymentsToAcquirePropertyPlantAndEquipment")
+    dividends = get_sec_fact(cik, "PaymentsOfDividends")
+
+    info = yf.Ticker(ticker).info
+    market_cap = info.get("marketCap")
+
+    ffo = net_income + depreciation if net_income and depreciation else None
+    affo = ffo - abs(capex) if ffo and capex else None
+
+    results = {
+        "FFO": ffo,
+        "AFFO": affo
+    }
+
+    if ffo and market_cap:
+        results["P/FFO"] = market_cap / ffo
+        results["FFO Yield"] = (ffo / market_cap) * 100
+
+    if affo and market_cap:
+        results["P/AFFO"] = market_cap / affo
+        results["AFFO Yield"] = (affo / market_cap) * 100
+
+    if dividends and ffo:
+        results["Payout Ratio (FFO)"] = (dividends / ffo) * 100
+
+    return results
+
+
 def fetch_and_cache_fundamentals(ticker):
     cik = get_cik(ticker)
     if not cik:
@@ -643,6 +683,9 @@ def fetch_and_cache_fundamentals(ticker):
             pass
     except Exception as e:
         pass
+    # --- ADD REIT METRICS ---
+    reit_data = fetch_reit_metrics(ticker)
+    data.update(reit_data)
     CACHE[ticker] = {"timestamp": time(), "data": data}
     return data
 
