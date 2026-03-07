@@ -263,7 +263,8 @@ VALID_METRICS = {
     "Short-Term Investments", "Total Current Liabilities", "Debt / FCF Ratio",
     "Total Current Assets", "Total Assets", "Retained Earnings", "Shareholders' Equity",
     "Total Liabilities", "Free Cash Flow", "Operating Cash Flow", "FCF Yield",
-    "Capital Expenditures", "Net Income", "Occupancy Rate"
+    "Capital Expenditures", "Net Income", "Occupancy Rate",
+    "FFO", "AFFO", "P/FFO", "P/AFFO", "FFO Yield", "AFFO Yield", "Payout Ratio (FFO)"
 }
 
 def get_cik(ticker):
