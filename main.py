@@ -352,7 +352,19 @@ def fetch_occupancy_rate(ticker):
     except Exception:
         return None
 
-
+def get_sec_fact(cik, tag):
+    """Fetch a specific fact from SEC XBRL data"""
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    headers = {"User-Agent": "Andres Garcia (30andgarcia@yourdomain.com)"}
+    try:
+        data = requests.get(url, headers=headers).json()
+        facts = data["facts"]["us-gaap"]
+        if tag not in facts:
+            return None
+        units = list(facts[tag]["units"].values())[0]
+        return units[-1]["val"]
+    except:
+        return None
 
 def fetch_reit_metrics(ticker):
     """
@@ -367,7 +379,7 @@ def fetch_reit_metrics(ticker):
     capex = get_sec_fact(cik, "PaymentsToAcquirePropertyPlantAndEquipment")
     dividends = get_sec_fact(cik, "PaymentsOfDividends")
 
-    info = yf.Ticker(ticker).info
+    info = _get_yf().Ticker(ticker).info
     market_cap = info.get("marketCap")
 
     ffo = net_income + depreciation if net_income and depreciation else None
