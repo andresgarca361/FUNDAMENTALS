@@ -264,7 +264,9 @@ VALID_METRICS = {
     "Total Current Assets", "Total Assets", "Retained Earnings", "Shareholders' Equity",
     "Total Liabilities", "Free Cash Flow", "Operating Cash Flow", "FCF Yield",
     "Capital Expenditures", "Net Income", "Occupancy Rate",
-    "FFO", "AFFO", "P/FFO", "P/AFFO", "FFO Yield", "AFFO Yield", "Payout Ratio (FFO)"
+    "FFO", "AFFO", "P/FFO", "P/AFFO", "FFO Yield", "AFFO Yield", 
+    "Payout Ratio (FFO)", "Payout Ratio (AFFO)",
+    "FFO per Share", "AFFO per Share", "NOI"
 }
 
 def get_cik(ticker):
@@ -368,42 +370,87 @@ def get_sec_fact(cik, tag):
 
 def fetch_reit_metrics(ticker):
     """
-    Fetch FFO, AFFO, P/FFO, AFFO Yield, Payout Ratio from SEC filings + yfinance
+    Fetch FFO, AFFO, NOI, P/FFO, P/AFFO, AFFO Yield, Payout Ratio from SEC filings + yfinance
     """
     cik = get_cik(ticker)
     if not cik:
         return {}
 
+    # Core financial data from SEC
     net_income = get_sec_fact(cik, "NetIncomeLoss")
     depreciation = get_sec_fact(cik, "DepreciationDepletionAndAmortization")
+    amortization = get_sec_fact(cik, "AmortizationOfIntangibleAssets")
     capex = get_sec_fact(cik, "PaymentsToAcquirePropertyPlantAndEquipment")
+    straight_line_rent = get_sec_fact(cik, "StraightLineRentAdjustment")  # Deferred rent
+    stock_comp = get_sec_fact(cik, "ShareBasedCompensation")  # Stock-based comp
     dividends = get_sec_fact(cik, "PaymentsOfDividends")
-
+    
+    # Operating income (for NOI calculation)
+    operating_income = get_sec_fact(cik, "OperatingIncomeLoss")
+    revenues = get_sec_fact(cik, "Revenues")
+    
     info = _get_yf().Ticker(ticker).info
     market_cap = info.get("marketCap")
+    shares_outstanding = info.get("sharesOutstanding")
 
-    ffo = net_income + depreciation if net_income and depreciation else None
-    affo = ffo - abs(capex) if ffo and capex else None
+    results = {}
 
-    results = {
-        "FFO": ffo,
-        "AFFO": affo
-    }
+    # ========== FFO CALCULATION ==========
+    # FFO = Net Income + Depreciation & Amortization - Gains on asset sales
+    if net_income and depreciation:
+        ffo = net_income + depreciation
+        if amortization:
+            ffo += amortization
+        results["FFO"] = ffo
+        
+        if shares_outstanding:
+            results["FFO per Share"] = ffo / shares_outstanding
+        if market_cap:
+            results["P/FFO"] = market_cap / ffo
+            results["FFO Yield"] = (ffo / market_cap) * 100
 
-    if ffo and market_cap:
-        results["P/FFO"] = market_cap / ffo
-        results["FFO Yield"] = (ffo / market_cap) * 100
+    # ========== AFFO CALCULATION ==========
+    # AFFO = FFO - CapEx - Straight-line rent adj - Stock comp + Leasing amortization
+    if results.get("FFO"):
+        affo = results["FFO"]
+        
+        # Subtract CapEx (maintenance capital expenditures)
+        if capex:
+            affo -= abs(capex)
+        
+        # Adjust for straight-line rent (deferred rent)
+        if straight_line_rent:
+            affo -= straight_line_rent
+        
+        # Subtract stock-based compensation
+        if stock_comp:
+            affo -= stock_comp
+        
+        results["AFFO"] = affo
+        
+        if shares_outstanding:
+            results["AFFO per Share"] = affo / shares_outstanding
+        if market_cap:
+            results["P/AFFO"] = market_cap / affo
+            results["AFFO Yield"] = (affo / market_cap) * 100
 
-    if affo and market_cap:
-        results["P/AFFO"] = market_cap / affo
-        results["AFFO Yield"] = (affo / market_cap) * 100
+    # ========== NOI CALCULATION ==========
+    # NOI = Operating Income (or Revenue - Operating Expenses)
+    # For REITs, this is often calculated from 10-Q/10-K filings
+    if operating_income:
+        results["NOI"] = operating_income
+    elif revenues:
+        # Fallback: estimate NOI from revenues (conservative)
+        results["NOI"] = revenues * 0.60  # Rough estimate, may need adjustment
 
-    if dividends and ffo:
-        results["Payout Ratio (FFO)"] = (dividends / ffo) * 100
+    # ========== PAYOUT RATIOS ==========
+    if results.get("FFO") and dividends:
+        results["Payout Ratio (FFO)"] = (dividends / results["FFO"]) * 100
+    
+    if results.get("AFFO") and dividends:
+        results["Payout Ratio (AFFO)"] = (dividends / results["AFFO"]) * 100
 
     return results
-
-
 def fetch_and_cache_fundamentals(ticker):
     cik = get_cik(ticker)
     if not cik:
